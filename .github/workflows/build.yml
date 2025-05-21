@@ -21,7 +21,7 @@ jobs:
           app-dir: roger_bruteforce
 
       - name: Upload FAP Artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@3d014f6f8a26e79ea63f5937a6ac13d3dd6beaa6
         with:
           name: ${{ github.event.repository.name }}-${{ steps.build.outputs.suffix }}
           path: ${{ steps.build.outputs.fap-artifacts }}
