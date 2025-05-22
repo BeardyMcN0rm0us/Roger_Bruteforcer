@@ -17,6 +17,7 @@ jobs:
         with:
           sdk-channel: dev
           app-dir: roger_bruteforce
+          args: fap_roger_bruteforce
 
       - name: Create GitHub Release and Upload FAP
         env:
