@@ -1,10 +1,8 @@
-name: "Build Flipper Zero App"
+name: "Build Flipper Zero App and Upload to Release"
 
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: ["**"]
 
 jobs:
   build-fap:
@@ -20,8 +18,34 @@ jobs:
           sdk-channel: dev
           app-dir: roger_bruteforce
 
-      - name: Upload FAP Artifact
-        uses: actions/upload-artifact@3d014f6f8a26e79ea63f5937a6ac13d3dd6beaa6
-        with:
-          name: ${{ github.event.repository.name }}-${{ steps.build.outputs.suffix }}
-          path: ${{ steps.build.outputs.fap-artifacts }}
+      - name: Create GitHub Release and Upload FAP
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          TAG_NAME: auto-fap-release
+        run: |
+          fap_file=$(find ${{ steps.build.outputs.fap-artifacts }} -name "*.fap" | head -n 1)
+          echo "FAP file: $fap_file"
+
+          echo "Creating or updating release..."
+          RELEASE_ID=$(curl -s \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG_NAME | jq -r '.id')
+
+          if [ "$RELEASE_ID" = "null" ]; then
+            echo "Creating new release..."
+            RELEASE_JSON=$(curl -s \
+              -X POST \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"tag_name\":\"$TAG_NAME\",\"name\":\"Auto FAP Release\",\"body\":\"Automated release of compiled .fap.\",\"draft\":false,\"prerelease\":false}" \
+              https://api.github.com/repos/${{ github.repository }}/releases)
+            RELEASE_ID=$(echo "$RELEASE_JSON" | jq -r '.id')
+          fi
+
+          echo "Uploading FAP..."
+          curl -s \
+            -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @"$fap_file" \
+            "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=$(basename $fap_file)"
