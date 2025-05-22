@@ -1,9 +1,10 @@
-appid: roger_bruteforce
-name: Roger Brute-Force
-apptype: app
-entry: roger_bruteforce_app
-stack_size: 1024
-requires:
-  - SubGhz
-  - Gui
-  - Input
+from fbt_app_manifest import App, AppType
+
+App(
+    appid="roger_bruteforce",
+    name="Roger Brute-Force",
+    apptype=AppType.App,
+    entry="roger_bruteforce_app",
+    stack_size=1024,
+    requires=["SubGhz", "Gui", "Input"],
+)
