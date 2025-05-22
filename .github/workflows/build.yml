@@ -18,7 +18,6 @@ jobs:
           sdk-channel: dev
           app-dir: roger_bruteforce
           ufbt-args: fap_roger_bruteforce
-          ufbt-args: fap_roger_bruteforce
 
       - name: Create GitHub Release and Upload FAP
         env:
