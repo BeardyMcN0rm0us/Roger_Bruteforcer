@@ -1,4 +1,4 @@
-// Roger Brute-Force App for Flipper Zero
+// Roger gate App for Flipper Zero
 #include <furi.h>
 #include <furi_hal.h>
 #include <gui/gui.h>
@@ -30,13 +30,13 @@ void send_fixed_code(uint16_t code) {
     furi_delay_us(SEND_DELAY_US);
 }
 
-int32_t roger_bruteforce_app(void* p) {
+int32_t roger_gate_app(void* p) {
     UNUSED(p);
     uint16_t current_code = 0;
 
     ViewPort* view = view_port_alloc();
     view_port_draw_callback_set(view, [](Canvas* canvas, void* ctx) {
-        canvas_draw_str(canvas, 5, 15, "Roger Brute-Force");
+        canvas_draw_str(canvas, 5, 15, "Roger gate");
         canvas_draw_str(canvas, 5, 30, "Press BACK to stop");
     }, NULL);
 
