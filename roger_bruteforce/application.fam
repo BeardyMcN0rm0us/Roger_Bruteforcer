@@ -1,7 +1,7 @@
 App(
     appid="roger_bruteforce",
     name="Roger Brute-Force",
-    apptype=AppType.App,
+    apptype=FlipperAppType.APP,
     entry_point="roger_gate_app",
     stack_size=4096,
     fap_version=(1, 0),
