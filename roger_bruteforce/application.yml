@@ -1,8 +1,8 @@
 appid: roger_bruteforce
 name: Roger Brute-Force
 apptype: app
-entry: roger_bruteforce_app
-stack_size: 1024
+entry: roger_gate_app
+stack_size: 8192
 requires:
   - SubGhz
   - Gui

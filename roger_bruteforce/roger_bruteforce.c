@@ -20,10 +20,10 @@
 
 // ── Transmit state passed to the async callback ──────────────────────────────
 typedef struct {
-    LevelDuration* sequence;   // pre-built pulse sequence
-    size_t         length;     // total number of LevelDuration entries
-    size_t         index;      // current position in sequence
-    FuriSemaphore* done_sem;   // signalled when sequence is exhausted
+    LevelDuration* sequence;
+    size_t         length;
+    size_t         index;
+    FuriSemaphore* done_sem;
 } TxState;
 
 // ── Async TX callback — called by the HAL to fetch the next sample ───────────
@@ -32,9 +32,12 @@ static LevelDuration tx_callback(void* ctx) {
     if(s->index < s->length) {
         return s->sequence[s->index++];
     }
-    // End of sequence: return silence and signal completion
-    furi_semaphore_release(s->done_sem);
-    return level_duration_reset(); // tells HAL we are done
+    // Signal completion exactly once, then tell the HAL we are done.
+    if(s->index == s->length) {
+        s->index++;
+        furi_semaphore_release(s->done_sem);
+    }
+    return level_duration_reset();
 }
 
 // ── Build LevelDuration sequence for one 12-bit Roger-gate code ──────────────
@@ -43,11 +46,9 @@ static size_t build_sequence(uint16_t code, LevelDuration* seq, size_t seq_len) 
     if(seq_len < 27) return 0;
     size_t i = 0;
 
-    // Sync pulse
     seq[i++] = level_duration_make(true,  SYNC_ON_US);
     seq[i++] = level_duration_make(false, SYNC_OFF_US);
 
-    // 12 data bits, MSB first
     for(int b = 11; b >= 0; b--) {
         if((code >> b) & 1) {
             seq[i++] = level_duration_make(true,  BIT1_ON_US);
@@ -58,7 +59,6 @@ static size_t build_sequence(uint16_t code, LevelDuration* seq, size_t seq_len) 
         }
     }
 
-    // Trailing high to close the last bit
     seq[i++] = level_duration_make(true, BIT1_ON_US);
 
     return i;
@@ -66,31 +66,34 @@ static size_t build_sequence(uint16_t code, LevelDuration* seq, size_t seq_len) 
 
 // ── Transmit one code word ────────────────────────────────────────────────────
 static void send_code(uint16_t code) {
+    // SubGhz is a shared resource; acquire before touching any HAL functions.
+    if(!furi_hal_subghz_acquire()) return;
+
     LevelDuration seq[27];
     size_t seq_len = build_sequence(code, seq, 27);
-    if(seq_len == 0) return;
+    if(seq_len == 0) {
+        furi_hal_subghz_release();
+        return;
+    }
 
     TxState state = {
         .sequence = seq,
         .length   = seq_len,
         .index    = 0,
-        .done_sem = furi_semaphore_alloc(1, 0), // max=1, initial=0
+        .done_sem = furi_semaphore_alloc(1, 0),
     };
 
-    // Configure radio
     furi_hal_subghz_reset();
     furi_hal_subghz_load_preset(FuriHalSubGhzPresetOok270Async);
     furi_hal_subghz_set_frequency_and_path(ROGER_FREQ);
-    furi_hal_subghz_tx(); // switch to TX mode
-
-    // Start async transmission
+    furi_hal_subghz_tx();
     furi_hal_subghz_start_async_tx(tx_callback, &state);
 
-    // Wait for callback to signal completion (200 ms max)
     furi_semaphore_acquire(state.done_sem, furi_ms_to_ticks(200));
 
     furi_hal_subghz_stop_async_tx();
     furi_hal_subghz_sleep();
+    furi_hal_subghz_release();
     furi_semaphore_free(state.done_sem);
 
     furi_delay_us(SEND_DELAY_US);
@@ -99,6 +102,7 @@ static void send_code(uint16_t code) {
 // ── App context ───────────────────────────────────────────────────────────────
 typedef struct {
     FuriMessageQueue* input_queue;
+    FuriMutex*        code_mutex;
     volatile bool     stop;
     uint16_t          current_code;
 } AppCtx;
@@ -106,13 +110,18 @@ typedef struct {
 // ── Draw callback ─────────────────────────────────────────────────────────────
 static void draw_cb(Canvas* canvas, void* ctx) {
     AppCtx* app = ctx;
+
+    furi_mutex_acquire(app->code_mutex, FuriWaitForever);
+    uint16_t code = app->current_code;
+    furi_mutex_release(app->code_mutex);
+
     canvas_clear(canvas);
     canvas_set_font(canvas, FontPrimary);
     canvas_draw_str(canvas, 5, 15, "Roger Gate BF");
     canvas_set_font(canvas, FontSecondary);
 
     char buf[32];
-    snprintf(buf, sizeof(buf), "Code: %04X / FFF", app->current_code);
+    snprintf(buf, sizeof(buf), "Code: %04X / FFF", code);
     canvas_draw_str(canvas, 5, 30, buf);
     canvas_draw_str(canvas, 5, 45, "BACK to stop");
 }
@@ -129,6 +138,7 @@ int32_t roger_gate_app(void* p) {
 
     AppCtx app = {
         .input_queue  = furi_message_queue_alloc(8, sizeof(InputEvent)),
+        .code_mutex   = furi_mutex_alloc(FuriMutexTypeNormal),
         .stop         = false,
         .current_code = 0,
     };
@@ -142,7 +152,7 @@ int32_t roger_gate_app(void* p) {
 
     while(!app.stop && app.current_code < MAX_ATTEMPTS) {
         send_code(app.current_code);
-        view_port_update(vp); // refresh progress on screen
+        view_port_update(vp);
 
         InputEvent event;
         while(furi_message_queue_get(app.input_queue, &event, 0) == FuriStatusOk) {
@@ -151,13 +161,15 @@ int32_t roger_gate_app(void* p) {
             }
         }
 
+        furi_mutex_acquire(app.code_mutex, FuriWaitForever);
         app.current_code++;
+        furi_mutex_release(app.code_mutex);
     }
 
-    // Cleanup
     gui_remove_view_port(gui, vp);
     furi_record_close(RECORD_GUI);
     view_port_free(vp);
+    furi_mutex_free(app.code_mutex);
     furi_message_queue_free(app.input_queue);
 
     return 0;
