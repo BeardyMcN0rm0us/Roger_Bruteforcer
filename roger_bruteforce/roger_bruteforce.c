@@ -1,6 +1,6 @@
 // RF Gate Multi-Brand Brute-force for Flipper Zero
 // de Bruijn B(2,n) covers every n-bit code as an overlapping window in 2^n bits.
-// Roger, CAME TOP, Nice FLO, Linear 300 MHz.
+// Roger, CAME TOP, Nice FLO, Linear 300 MHz, Custom 480µs (measured).
 #include <furi.h>
 #include <furi_hal.h>
 #include <furi_hal_subghz.h>
@@ -28,12 +28,17 @@ typedef struct {
 // Timing values sourced from published protocol specs and Flipper SubGhz
 // implementation.  CAME/Nice/Linear values are approximate; adjust if your
 // hardware uses a non-standard variant.
+// "Custom 480us" timing measured directly from captured RAW signals
+// (Gate_inner.sub / Gate_outer.sub): te=480µs, 28-bit fixed code frame,
+// inter-frame gap ~11200µs.  12-bit de Bruijn covers the most common
+// DIP-switch code widths (4096 combos) in ~3.5 s.
 static const Protocol PROTOS[] = {
     // name           freq        ord  sOn   sOff   1on  1off   0on  0off rep
     { "Roger Gate",  433920000,  12,  100,  3100,  600,  200,  200,  600,  1 },
     { "CAME TOP",    433920000,  12,  320,  9100,  320,  640,  640,  320,  3 },
     { "Nice FLO",    433920000,  12,  500,  8500,  500, 1000, 1000,  500,  2 },
     { "Linear 300",  300000000,  10, 1200, 10000,  600, 1200, 1200,  600,  3 },
+    { "Custom 480us",433920000,  12,  480, 12000,  960,  480,  480,  960,  3 },
 };
 #define PROTO_COUNT ((uint8_t)(sizeof(PROTOS) / sizeof(PROTOS[0])))
 
@@ -154,8 +159,12 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     if(state == STATE_MENU) {
         canvas_draw_str(canvas, 2, 10, "RF Gate Brute-Force");
         canvas_set_font(canvas, FontSecondary);
-        for(uint8_t i = 0; i < PROTO_COUNT; i++) {
-            uint8_t y = 22 + i * 11;
+        // Scrolling window: show 4 items centred on selected
+        uint8_t first = (sel >= 2) ? (sel - 1) : 0;
+        if(first + 4 > PROTO_COUNT) first = (PROTO_COUNT >= 4) ? PROTO_COUNT - 4 : 0;
+        for(uint8_t vi = 0; vi < 4 && (first + vi) < PROTO_COUNT; vi++) {
+            uint8_t i = first + vi;
+            uint8_t y = 21 + vi * 11;
             if(i == sel) {
                 canvas_set_color(canvas, ColorBlack);
                 canvas_draw_box(canvas, 0, y - 8, 128, 10);
