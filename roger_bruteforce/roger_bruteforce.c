@@ -44,11 +44,11 @@ typedef struct {
 // fixed_val bits set at uint32 positions 20,19,7  (frame positions 6,7,19 = 1)
 // Sync gap 3000 µs → 4096 codes × ~42 ms ≈ 173 s total.
 static const Protocol PROTOS[] = {
-    // name            freq        ord  sOn   sOff   1on  1off   0on  0off rep
-    { "Roger Gate",  433920000,  12,  100,  3100,  600,  200,  200,  600,  1 },
-    { "CAME TOP",    433920000,  12,  320,  9100,  320,  640,  640,  320,  1 },
-    { "Nice FLO",    433920000,  12,  500,  8500,  500, 1000, 1000,  500,  1 },
-    { "Linear 300",  300000000,  10, 1200, 10000,  600, 1200, 1200,  600,  1 },
+    // name            freq        ord  sOn   sOff   1on  1off   0on  0off rep  fb    var_mask     fixed_val
+    { "Roger Gate",  433920000,  12,  100,  3100,  600,  200,  200,  600,  1,   0, 0x00000000u, 0x00000000u },
+    { "CAME TOP",    433920000,  12,  320,  9100,  320,  640,  640,  320,  1,   0, 0x00000000u, 0x00000000u },
+    { "Nice FLO",    433920000,  12,  500,  8500,  500, 1000, 1000,  500,  1,   0, 0x00000000u, 0x00000000u },
+    { "Linear 300",  300000000,  10, 1200, 10000,  600, 1200, 1200,  600,  1,   0, 0x00000000u, 0x00000000u },
     // Roger 27-bit: te=480µs, 12 address bits embedded in 27-bit fixed frame
     { "Roger 27-bit",433920000,  12,  480,  3000,  960,  480,  480,  960,  1,
       27, 0x03E6B810u, 0x00180080u },
@@ -227,7 +227,7 @@ static void draw_cb(Canvas* canvas, void* ctx) {
                         + (uint32_t)fb * ((uint32_t)PROTOS[sel].bit1_on + PROTOS[sel].bit1_off);
         uint32_t est_s  = us_ea * (uint32_t)(1u << PROTOS[sel].order)
                         * PROTOS[sel].repeats / 1000000u;
-        snprintf(buf, sizeof(buf), "~%u:%02u  BACK:abort", est_s / 60, est_s % 60);
+        snprintf(buf, sizeof(buf), "~%u:%02u  BACK:abort", (unsigned)(est_s / 60), (unsigned)(est_s % 60));
         canvas_draw_str(canvas, 2, 57, buf);
 
     } else {
