@@ -54,6 +54,17 @@ jobs:
             RELEASE_ID=$(echo "$RELEASE_JSON" | jq -r '.id')
           fi
 
+          echo "Deleting existing asset if present..."
+          ASSET_ID=$(curl -s \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets" \
+            | jq -r '.[] | select(.name == "roger_bruteforce.fap") | .id')
+          if [ -n "$ASSET_ID" ] && [ "$ASSET_ID" != "null" ]; then
+            curl -s -X DELETE \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/assets/$ASSET_ID"
+          fi
+
           echo "Uploading FAP..."
           curl -s \
             -X POST \
