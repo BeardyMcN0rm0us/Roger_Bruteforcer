@@ -179,7 +179,7 @@ static void draw_cb(Canvas* canvas, void* ctx) {
         canvas_draw_str(canvas, 2, 10, PROTOS[sel].name);
         canvas_set_font(canvas, FontSecondary);
         uint8_t pct = total > 0 ? (uint8_t)((prog * 100) / total) : 0;
-        char buf[24];
+        char buf[32];
         snprintf(buf, sizeof(buf), "Sending... %3u%%", pct);
         canvas_draw_str(canvas, 2, 23, buf);
         canvas_draw_frame(canvas, 2, 27, 124, 8);
