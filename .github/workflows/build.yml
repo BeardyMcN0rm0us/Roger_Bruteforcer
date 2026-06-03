@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: write
+
 jobs:
   build-fap:
     runs-on: ubuntu-latest
@@ -20,9 +23,16 @@ jobs:
           sdk-channel: release
           app-dir: roger_bruteforce
 
+      - name: Upload FAP as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: roger_bruteforce.fap
+          path: ${{ steps.build.outputs.fap-artifacts }}/*.fap
+
       - name: Create GitHub Release and Upload FAP
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: auto-fap-release
         run: |
           fap_file=$(find ${{ steps.build.outputs.fap-artifacts }} -name "*.fap" | head -n 1)
