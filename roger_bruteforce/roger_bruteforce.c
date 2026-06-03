@@ -10,13 +10,40 @@
 #define MAX_ATTEMPTS   4096
 #define SEND_DELAY_US  50000
 
-// ── Pulse timing (LevelDuration packs level + µs duration into one uint32_t) ─
+// ── Pulse timing ─────────────────────────────────────────────────────────────
 #define BIT1_ON_US   600
 #define BIT1_OFF_US  200
 #define BIT0_ON_US   200
 #define BIT0_OFF_US  600
 #define SYNC_ON_US   100
 #define SYNC_OFF_US  3100
+
+// ── OOK 270 kHz async preset for CC1101 ──────────────────────────────────────
+// Format: pairs of (register_address, value) terminated by (0x00, 0x00),
+// followed by 8 patable bytes.  Values sourced from Flipper firmware
+// subghz_device_cc1101_preset_ook_270khz_async_regs.
+static const uint8_t preset_ook270[] = {
+    0x02, 0x0D, // IOCFG0  – GDO0 signal
+    0x03, 0x47, // FIFOTHR
+    0x08, 0x32, // PKTCTRL0 – async serial mode, infinite packet
+    0x0B, 0x06, // FSCTRL1
+    0x14, 0x00, // MDMCFG0
+    0x13, 0x00, // MDMCFG1
+    0x12, 0x30, // MDMCFG2 – OOK modulation
+    0x11, 0x32, // MDMCFG3
+    0x10, 0x67, // MDMCFG4 – ~270 kHz bandwidth
+    0x18, 0x18, // MCSM0
+    0x19, 0x18, // FOCCFG
+    0x1D, 0x40, // AGCCTRL0
+    0x1C, 0x00, // AGCCTRL1
+    0x1B, 0x03, // AGCCTRL2
+    0x20, 0xFB, // WORCTRL
+    0x22, 0x11, // FREND0  – OOK power ramp
+    0x21, 0xB6, // FREND1
+    0x00, 0x00, // end marker
+    // PATABLE (8 bytes): 0 dBm off, max power on
+    0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
 
 // ── Transmit state passed to the async callback ──────────────────────────────
 typedef struct {
@@ -66,15 +93,9 @@ static size_t build_sequence(uint16_t code, LevelDuration* seq, size_t seq_len) 
 
 // ── Transmit one code word ────────────────────────────────────────────────────
 static void send_code(uint16_t code) {
-    // SubGhz is a shared resource; acquire before touching any HAL functions.
-    if(!furi_hal_subghz_acquire()) return;
-
     LevelDuration seq[27];
     size_t seq_len = build_sequence(code, seq, 27);
-    if(seq_len == 0) {
-        furi_hal_subghz_release();
-        return;
-    }
+    if(seq_len == 0) return;
 
     TxState state = {
         .sequence = seq,
@@ -84,7 +105,7 @@ static void send_code(uint16_t code) {
     };
 
     furi_hal_subghz_reset();
-    furi_hal_subghz_load_preset(FuriHalSubGhzPresetOok270Async);
+    furi_hal_subghz_load_custom_preset(preset_ook270);
     furi_hal_subghz_set_frequency_and_path(ROGER_FREQ);
     furi_hal_subghz_tx();
     furi_hal_subghz_start_async_tx(tx_callback, &state);
@@ -93,7 +114,6 @@ static void send_code(uint16_t code) {
 
     furi_hal_subghz_stop_async_tx();
     furi_hal_subghz_sleep();
-    furi_hal_subghz_release();
     furi_semaphore_free(state.done_sem);
 
     furi_delay_us(SEND_DELAY_US);
