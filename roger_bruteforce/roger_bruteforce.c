@@ -42,15 +42,18 @@ typedef struct {
 //   . X X X X X . . X X . X . X X X . . . . . . X . . . .
 // var_mask  bits set at uint32 positions 25,24,23,22,21,18,17,15,13,12,11,4
 // fixed_val bits set at uint32 positions 20,19,7  (frame positions 6,7,19 = 1)
-// Sync gap 3000 µs → 4096 codes × ~42 ms ≈ 173 s total.
+// Sync gap 11500 µs (≥ measured minimum of 11306 µs for both gates).
+// 4096 codes × ~50.5 ms ≈ 208 s total.
 static const Protocol PROTOS[] = {
     // name            freq        ord  sOn   sOff   1on  1off   0on  0off rep  fb    var_mask     fixed_val
     { "Roger Gate",  433920000,  12,  100,  3100,  600,  200,  200,  600,  1,   0, 0x00000000u, 0x00000000u },
     { "CAME TOP",    433920000,  12,  320,  9100,  320,  640,  640,  320,  1,   0, 0x00000000u, 0x00000000u },
     { "Nice FLO",    433920000,  12,  500,  8500,  500, 1000, 1000,  500,  1,   0, 0x00000000u, 0x00000000u },
     { "Linear 300",  300000000,  10, 1200, 10000,  600, 1200, 1200,  600,  1,   0, 0x00000000u, 0x00000000u },
-    // Roger 27-bit: te=480µs, 12 address bits embedded in 27-bit fixed frame
-    { "Roger 27-bit",433920000,  12,  480,  3000,  960,  480,  480,  960,  1,
+    // Roger 27-bit: te=480µs, 12 address bits embedded in 27-bit fixed frame.
+    // sync_off=11500µs clears the ≥11306µs minimum inter-frame gap required by
+    // both captured gate receivers (measured from RAW captures).
+    { "Roger 27-bit",433920000,  12,  480, 11500,  960,  480,  480,  960,  1,
       27, 0x03E6B810u, 0x00180080u },
 };
 #define PROTO_COUNT ((uint8_t)(sizeof(PROTOS) / sizeof(PROTOS[0])))
