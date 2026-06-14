@@ -30,6 +30,10 @@ typedef struct {
     uint8_t     frame_bits; // total bits per frame (0 = same as order)
     uint32_t    var_mask;   // which frame bit positions are variable (MSB=first tx'd bit)
     uint32_t    fixed_val;  // values of the fixed bit positions
+    // Burst / range extension
+    uint8_t         bursts;     // consecutive identical frames per code (receiver de-bounce)
+    uint16_t        code_base;  // first code to transmit
+    uint16_t        code_count; // number of codes from code_base (0 → full 2^order sweep from 0)
 } Protocol;
 
 // Timing values sourced from published protocol specs and Flipper SubGhz
@@ -43,24 +47,34 @@ typedef struct {
 // var_mask  bits set at uint32 positions 25,24,23,22,21,18,17,15,13,12,11,4
 // fixed_val bits set at uint32 positions 20,19,7  (frame positions 6,7,19 = 1)
 // Sync gap 11500 µs (≥ measured minimum of 11306 µs for both gates).
-// 4096 codes × ~50.5 ms ≈ 208 s total.
+// Real remotes send each frame ~30× in a burst; receivers reject single
+// frames as noise, so every code is transmitted `bursts` times in a row.
 static const Protocol PROTOS[] = {
-    // name            freq        ord  sOn   sOff   1on  1off   0on  0off rep  fb    var_mask     fixed_val
-    { "Roger Gate",  433920000,  12,  100,  3100,  600,  200,  200,  600,  1,   0, 0x00000000u, 0x00000000u },
-    { "CAME TOP",    433920000,  12,  320,  9100,  320,  640,  640,  320,  1,   0, 0x00000000u, 0x00000000u },
-    { "Nice FLO",    433920000,  12,  500,  8500,  500, 1000, 1000,  500,  1,   0, 0x00000000u, 0x00000000u },
-    { "Linear 300",  300000000,  10, 1200, 10000,  600, 1200, 1200,  600,  1,   0, 0x00000000u, 0x00000000u },
-    // Roger 27-bit: te=480µs, 12 address bits embedded in 27-bit fixed frame.
-    // sync_off=11500µs clears the ≥11306µs minimum inter-frame gap required by
-    // both captured gate receivers (measured from RAW captures).
+    // name            freq        ord  sOn   sOff   1on  1off   0on  0off rep  fb    var_mask     fixed_val   burst base    count
+    // Roger KNOWN: sweeps the inclusive range between the two real gate codes
+    // (0x73B=1851 .. 0x8C4=2244 → 394 codes), each sent as a 3-frame burst.
+    // Covers both gates plus everything between them in ~60 s.  Default.
+    { "Roger KNOWN", 433920000,  12,  480, 11500,  960,  480,  480,  960,  1,
+      27, 0x03E6B810u, 0x00180080u,   3, 0x73Bu, 394 },
+    // Roger 27-bit sweep: brute-forces all 4096 addresses for an UNKNOWN Roger
+    // gate.  bursts=3 so the receiver accepts a hit (≈10 min full sweep).
     { "Roger 27-bit",433920000,  12,  480, 11500,  960,  480,  480,  960,  1,
-      27, 0x03E6B810u, 0x00180080u },
+      27, 0x03E6B810u, 0x00180080u,   3, 0u, 0 },
+    { "Roger Gate",  433920000,  12,  100,  3100,  600,  200,  200,  600,  1,   0, 0x00000000u, 0x00000000u,  1, 0u, 0 },
+    { "CAME TOP",    433920000,  12,  320,  9100,  320,  640,  640,  320,  1,   0, 0x00000000u, 0x00000000u,  1, 0u, 0 },
+    { "Nice FLO",    433920000,  12,  500,  8500,  500, 1000, 1000,  500,  1,   0, 0x00000000u, 0x00000000u,  1, 0u, 0 },
+    { "Linear 300",  300000000,  10, 1200, 10000,  600, 1200, 1200,  600,  1,   0, 0x00000000u, 0x00000000u,  1, 0u, 0 },
 };
 #define PROTO_COUNT ((uint8_t)(sizeof(PROTOS) / sizeof(PROTOS[0])))
 
 // ── Fixed-frame builder ───────────────────────────────────────────────────────
 // Scatters the `order`-bit code into the variable positions of a frame_bits-wide
 // frame, MSB of code → first variable position (MSB of frame).
+// Number of distinct codes a protocol transmits: explicit list, or full sweep.
+static uint16_t proto_num_codes(const Protocol* p) {
+    return p->code_count ? p->code_count : (uint16_t)(1u << p->order);
+}
+
 static uint32_t make_frame(const Protocol* p, uint16_t code) {
     uint32_t frame    = p->fixed_val;
     int8_t   code_bit = (int8_t)(p->order - 1);
@@ -96,14 +110,16 @@ typedef enum {
 
 typedef struct {
     const Protocol* proto;
-    uint16_t        code;
-    uint16_t        total_codes;
+    uint16_t        code;        // resolved address value for the current frame
+    uint16_t        idx;         // iterator position 0..(num_codes-1)
+    uint16_t        total_codes; // num_codes for this protocol
+    uint8_t         burst;       // current repeat within the active code
     uint8_t         pass;
     uint8_t         bit;
     TxPhase         phase;
     uint8_t         bit_val;
     FuriSemaphore*  done;
-    volatile size_t progress;
+    volatile size_t progress;    // frames transmitted so far
     volatile bool   stop;
     volatile bool   signaled;
     uint32_t        current_frame; // pre-built frame for fixed-frame protocols
@@ -130,6 +146,8 @@ static LevelDuration tx_callback(void* ctx) {
     case PHASE_SYNC_OFF:
         s->phase = PHASE_BIT_ON;
         s->bit   = 0;
+        // Resolve the address for this code (range base + iterator)
+        s->code = (uint16_t)(s->proto->code_base + s->idx);
         if(s->proto->frame_bits) {
             s->current_frame = make_frame(s->proto, s->code);
         }
@@ -157,13 +175,20 @@ static LevelDuration tx_callback(void* ctx) {
         if(s->bit < frame_end) {
             s->phase = PHASE_BIT_ON;
         } else {
-            s->code++;
-            if(s->code >= s->total_codes) {
-                s->code = 0;
-                s->pass++;
+            // One frame complete. Repeat the same code `bursts` times before
+            // advancing — receivers require several consecutive identical frames.
+            uint8_t bursts = s->proto->bursts ? s->proto->bursts : 1;
+            s->progress++;
+            s->burst++;
+            if(s->burst >= bursts) {
+                s->burst = 0;
+                s->idx++;
+                if(s->idx >= s->total_codes) {
+                    s->idx = 0;
+                    s->pass++;
+                }
             }
-            s->progress = (size_t)s->pass * s->total_codes + s->code;
-            s->phase    = PHASE_SYNC_ON;
+            s->phase = PHASE_SYNC_ON;
         }
         return ld;
     }
@@ -221,14 +246,16 @@ static void draw_cb(Canvas* canvas, void* ctx) {
         canvas_draw_str(canvas, 2, 23, buf);
         canvas_draw_frame(canvas, 2, 27, 124, 8);
         if(pct > 0) canvas_draw_box(canvas, 3, 28, (uint8_t)(122 * pct / 100), 6);
-        snprintf(buf, sizeof(buf), "%u codes x%u pass",
-                 (unsigned)(1u << PROTOS[sel].order), PROTOS[sel].repeats);
+        uint16_t ncodes = proto_num_codes(&PROTOS[sel]);
+        uint8_t  bursts = PROTOS[sel].bursts ? PROTOS[sel].bursts : 1;
+        snprintf(buf, sizeof(buf), "%u codes x%u burst",
+                 (unsigned)ncodes, (unsigned)bursts);
         canvas_draw_str(canvas, 2, 44, buf);
         // Estimated total time
         uint8_t  fb     = PROTOS[sel].frame_bits ? PROTOS[sel].frame_bits : PROTOS[sel].order;
         uint32_t us_ea  = (uint32_t)PROTOS[sel].sync_on + PROTOS[sel].sync_off
                         + (uint32_t)fb * ((uint32_t)PROTOS[sel].bit1_on + PROTOS[sel].bit1_off);
-        uint32_t est_s  = us_ea * (uint32_t)(1u << PROTOS[sel].order)
+        uint32_t est_s  = us_ea * (uint32_t)ncodes * bursts
                         * PROTOS[sel].repeats / 1000000u;
         snprintf(buf, sizeof(buf), "~%u:%02u  BACK:abort", (unsigned)(est_s / 60), (unsigned)(est_s % 60));
         canvas_draw_str(canvas, 2, 57, buf);
@@ -239,7 +266,7 @@ static void draw_cb(Canvas* canvas, void* ctx) {
         canvas_draw_str(canvas, 2, 28, "Done!");
         char buf[28];
         snprintf(buf, sizeof(buf), "%u codes sent.",
-                 (unsigned)(1u << PROTOS[sel].order));
+                 (unsigned)proto_num_codes(&PROTOS[sel]));
         canvas_draw_str(canvas, 2, 40, buf);
         canvas_draw_str(canvas, 2, 55, "BACK to return");
     }
@@ -287,19 +314,22 @@ int32_t roger_gate_app(void* p) {
                 view_port_update(vp);
             } else if(ev.key == InputKeyOk) {
                 const Protocol* pr = &PROTOS[app.sel];
-                uint16_t total_codes = (uint16_t)(1u << pr->order);
+                uint16_t num_codes = proto_num_codes(pr);
+                uint8_t  bursts    = pr->bursts ? pr->bursts : 1;
 
                 furi_mutex_acquire(app.mutex, FuriWaitForever);
                 app.state       = STATE_TX;
                 app.tx_progress = 0;
-                app.tx_total    = (size_t)total_codes * pr->repeats;
+                app.tx_total    = (size_t)num_codes * bursts * pr->repeats;
                 furi_mutex_release(app.mutex);
                 view_port_update(vp);
 
                 TxState tx = {
                     .proto       = pr,
                     .code        = 0,
-                    .total_codes = total_codes,
+                    .idx         = 0,
+                    .total_codes = num_codes,
+                    .burst       = 0,
                     .pass        = 0,
                     .bit         = 0,
                     .phase       = PHASE_SYNC_ON,
