@@ -39,25 +39,20 @@ typedef struct {
 // Timing values sourced from published protocol specs and Flipper SubGhz
 // implementation.  CAME/Nice/Linear values are approximate.
 //
-// Roger 27-bit: frame structure reverse-engineered from RAW captures of two
-// Roger fixed-code gate remotes.  Exactly 12 bits vary between remotes
+// Roger 27-bit: frame structure reverse-engineered from RAW captures of real
+// Roger fixed-code gate remotes.  Exactly 12 bits vary per remote
 // (DIP-equivalent address); 15 bits are fixed protocol overhead.
 // Frame template (. = fixed, X = address bit, MSB transmitted first):
 //   . X X X X X . . X X . X . X X X . . . . . . X . . . .
 // var_mask  bits set at uint32 positions 25,24,23,22,21,18,17,15,13,12,11,4
 // fixed_val bits set at uint32 positions 20,19,7  (frame positions 6,7,19 = 1)
-// Sync gap 11500 µs (≥ measured minimum of 11306 µs for both gates).
+// Sync gap 11500 µs (≥ measured minimum of 11306 µs on measured gates).
 // Real remotes send each frame ~30× in a burst; receivers reject single
 // frames as noise, so every code is transmitted `bursts` times in a row.
 static const Protocol PROTOS[] = {
     // name            freq        ord  sOn   sOff   1on  1off   0on  0off rep  fb    var_mask     fixed_val   burst base    count
-    // Roger KNOWN: sweeps the inclusive range between the two real gate codes
-    // (0x73B=1851 .. 0x8C4=2244 → 394 codes), each sent as a 3-frame burst.
-    // Covers both gates plus everything between them in ~60 s.  Default.
-    { "Roger KNOWN", 433920000,  12,  480, 11500,  960,  480,  480,  960,  1,
-      27, 0x03E6B810u, 0x00180080u,   3, 0x73Bu, 394 },
-    // Roger 27-bit sweep: brute-forces all 4096 addresses for an UNKNOWN Roger
-    // gate.  bursts=3 so the receiver accepts a hit (≈10 min full sweep).
+    // Roger 27-bit: full sweep of all 4096 addresses (12-bit DIP equivalent).
+    // bursts=3 so the receiver accepts a hit (≈10 min full sweep).
     { "Roger 27-bit",433920000,  12,  480, 11500,  960,  480,  480,  960,  1,
       27, 0x03E6B810u, 0x00180080u,   3, 0u, 0 },
     { "Roger Gate",  433920000,  12,  100,  3100,  600,  200,  200,  600,  1,   0, 0x00000000u, 0x00000000u,  1, 0u, 0 },
