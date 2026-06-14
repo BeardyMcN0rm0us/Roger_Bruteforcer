@@ -55,7 +55,7 @@ static const Protocol PROTOS[] = {
     // (0x73B=1851 .. 0x8C4=2244 → 394 codes), each sent as a 3-frame burst.
     // Covers both gates plus everything between them in ~60 s.  Default.
     { "Roger KNOWN", 433920000,  12,  480, 11500,  960,  480,  480,  960,  1,
-      27, 0x03E6B810u, 0x00180080u,   3, 0x73Bu, 394 },
+      27, 0x03E6B810u, 0x00180080u,   5, 0x73Bu, 394 },
     // Roger 27-bit sweep: brute-forces all 4096 addresses for an UNKNOWN Roger
     // gate.  bursts=3 so the receiver accepts a hit (≈10 min full sweep).
     { "Roger 27-bit",433920000,  12,  480, 11500,  960,  480,  480,  960,  1,
@@ -128,38 +128,42 @@ typedef struct {
 static LevelDuration tx_callback(void* ctx) {
     TxState* s = ctx;
 
-    if(s->phase == PHASE_SYNC_ON) {
-        if(s->stop || s->pass >= s->proto->repeats) {
-            if(!s->signaled) {
-                s->signaled = true;
-                furi_semaphore_release(s->done);
+    // For fixed-frame protocols: stop check and frame pre-build happen at bit 0
+    // (no PHASE_SYNC_ON between frames). For standard protocols: at PHASE_SYNC_ON.
+    if(s->proto->frame_bits) {
+        if(s->phase == PHASE_BIT_ON && s->bit == 0) {
+            if(s->stop || s->pass >= s->proto->repeats) {
+                if(!s->signaled) { s->signaled = true; furi_semaphore_release(s->done); }
+                return level_duration_reset();
             }
-            return level_duration_reset();
+            s->code          = (uint16_t)(s->proto->code_base + s->idx);
+            s->current_frame = make_frame(s->proto, s->code);
+        }
+    } else {
+        if(s->phase == PHASE_SYNC_ON) {
+            if(s->stop || s->pass >= s->proto->repeats) {
+                if(!s->signaled) { s->signaled = true; furi_semaphore_release(s->done); }
+                return level_duration_reset();
+            }
         }
     }
 
     switch(s->phase) {
-    case PHASE_SYNC_ON:
+    case PHASE_SYNC_ON:  // standard protocols only
         s->phase = PHASE_SYNC_OFF;
         return level_duration_make(true, s->proto->sync_on);
 
-    case PHASE_SYNC_OFF:
+    case PHASE_SYNC_OFF:  // standard protocols only
         s->phase = PHASE_BIT_ON;
         s->bit   = 0;
-        // Resolve the address for this code (range base + iterator)
-        s->code = (uint16_t)(s->proto->code_base + s->idx);
-        if(s->proto->frame_bits) {
-            s->current_frame = make_frame(s->proto, s->code);
-        }
+        s->code  = (uint16_t)(s->proto->code_base + s->idx);
         return level_duration_make(false, s->proto->sync_off);
 
     case PHASE_BIT_ON: {
         uint8_t bv;
         if(s->proto->frame_bits) {
-            // Fixed-frame: read MSB-first from pre-built 27(+)-bit frame
             bv = (s->current_frame >> (s->proto->frame_bits - 1 - s->bit)) & 1u;
         } else {
-            // Standard: read LSB-first from code value
             bv = (s->code >> s->bit) & 1u;
         }
         s->bit_val = bv;
@@ -168,29 +172,38 @@ static LevelDuration tx_callback(void* ctx) {
     }
 
     default: { // PHASE_BIT_OFF
-        LevelDuration ld = level_duration_make(
-            false, s->bit_val ? s->proto->bit1_off : s->proto->bit0_off);
         s->bit++;
         uint8_t frame_end = s->proto->frame_bits ? s->proto->frame_bits : s->proto->order;
+
         if(s->bit < frame_end) {
             s->phase = PHASE_BIT_ON;
-        } else {
-            // One frame complete. Repeat the same code `bursts` times before
-            // advancing — receivers require several consecutive identical frames.
-            uint8_t bursts = s->proto->bursts ? s->proto->bursts : 1;
-            s->progress++;
+            return level_duration_make(false, s->bit_val ? s->proto->bit1_off : s->proto->bit0_off);
+        }
+
+        // Last bit of frame — advance counters
+        s->progress++;
+        s->bit = 0;
+
+        if(s->proto->frame_bits) {
+            // Fixed-frame: next HIGH = next frame's bit 0 (no sync_on pulse).
+            // The last bit's LOW duration becomes the inter-frame gap, exactly
+            // matching the real remote's signal structure.
             s->burst++;
+            uint8_t bursts = s->proto->bursts ? s->proto->bursts : 1;
             if(s->burst >= bursts) {
                 s->burst = 0;
                 s->idx++;
-                if(s->idx >= s->total_codes) {
-                    s->idx = 0;
-                    s->pass++;
-                }
+                if(s->idx >= s->total_codes) { s->idx = 0; s->pass++; }
             }
+            s->phase = PHASE_BIT_ON;
+            return level_duration_make(false, s->proto->sync_off); // inter-frame gap
+        } else {
+            // Standard: preamble (sync_on HIGH + sync_off LOW) before every frame
+            s->idx++;
+            if(s->idx >= s->total_codes) { s->idx = 0; s->pass++; }
             s->phase = PHASE_SYNC_ON;
+            return level_duration_make(false, s->bit_val ? s->proto->bit1_off : s->proto->bit0_off);
         }
-        return ld;
     }
     }
 }
@@ -332,7 +345,9 @@ int32_t roger_gate_app(void* p) {
                     .burst       = 0,
                     .pass        = 0,
                     .bit         = 0,
-                    .phase       = PHASE_SYNC_ON,
+                    // Fixed-frame protocols start directly at bit 0 (no leading
+                    // sync pulse); standard protocols go through SYNC_ON/SYNC_OFF.
+                    .phase       = pr->frame_bits ? PHASE_BIT_ON : PHASE_SYNC_ON,
                     .bit_val     = 0,
                     .done        = furi_semaphore_alloc(1, 0),
                     .progress    = 0,
