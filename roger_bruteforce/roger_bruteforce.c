@@ -218,6 +218,7 @@ typedef struct {
     uint8_t           sel;
     size_t            tx_progress;
     size_t            tx_total;
+    bool              tx_error;   // TX could not start (frequency blocked by region)
 } AppCtx;
 
 static void draw_cb(Canvas* canvas, void* ctx) {
@@ -227,6 +228,7 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     uint8_t  sel   = app->sel;
     size_t   total = app->tx_total;
     size_t   prog  = app->tx_progress;
+    bool     error = app->tx_error;
     furi_mutex_release(app->mutex);
 
     canvas_clear(canvas);
@@ -276,11 +278,16 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     } else {
         canvas_draw_str(canvas, 2, 10, PROTOS[sel].name);
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str(canvas, 2, 28, "Done!");
-        char buf[28];
-        snprintf(buf, sizeof(buf), "%u codes sent.",
-                 (unsigned)proto_num_codes(&PROTOS[sel]));
-        canvas_draw_str(canvas, 2, 40, buf);
+        if(error) {
+            canvas_draw_str(canvas, 2, 28, "TX blocked!");
+            canvas_draw_str(canvas, 2, 40, "Freq not allowed by region.");
+        } else {
+            canvas_draw_str(canvas, 2, 28, "Done!");
+            char buf[28];
+            snprintf(buf, sizeof(buf), "%u codes sent.",
+                     (unsigned)proto_num_codes(&PROTOS[sel]));
+            canvas_draw_str(canvas, 2, 40, buf);
+        }
         canvas_draw_str(canvas, 2, 55, "BACK to return");
     }
 }
@@ -301,6 +308,7 @@ int32_t roger_gate_app(void* p) {
         .sel         = 0,
         .tx_progress = 0,
         .tx_total    = 0,
+        .tx_error    = false,
     };
 
     ViewPort* vp = view_port_alloc();
@@ -334,6 +342,7 @@ int32_t roger_gate_app(void* p) {
                 app.state       = STATE_TX;
                 app.tx_progress = 0;
                 app.tx_total    = (size_t)num_codes * bursts * pr->repeats;
+                app.tx_error    = false;
                 furi_mutex_release(app.mutex);
                 view_port_update(vp);
 
@@ -358,35 +367,39 @@ int32_t roger_gate_app(void* p) {
                 furi_hal_subghz_reset();
                 furi_hal_subghz_load_custom_preset(PRESET_OOK270);
                 furi_hal_subghz_set_frequency_and_path(pr->freq);
-                furi_hal_subghz_tx();
-                furi_hal_subghz_start_async_tx(tx_callback, &tx);
-                notification_message(notif, &sequence_blink_start_red);
+                bool tx_started = furi_hal_subghz_start_async_tx(tx_callback, &tx);
 
                 bool aborted = false;
-                while(true) {
-                    if(furi_semaphore_acquire(tx.done, furi_ms_to_ticks(50)) == FuriStatusOk)
-                        break;
-                    furi_mutex_acquire(app.mutex, FuriWaitForever);
-                    app.tx_progress = tx.progress;
-                    furi_mutex_release(app.mutex);
-                    view_port_update(vp);
-                    InputEvent pev;
-                    while(furi_message_queue_get(app.queue, &pev, 0) == FuriStatusOk) {
-                        if(pev.type == InputTypeShort && pev.key == InputKeyBack) {
-                            aborted = true;
-                            tx.stop = true;
+                if(tx_started) {
+                    notification_message(notif, &sequence_blink_start_red);
+
+                    while(true) {
+                        if(furi_semaphore_acquire(tx.done, furi_ms_to_ticks(50)) == FuriStatusOk)
+                            break;
+                        furi_mutex_acquire(app.mutex, FuriWaitForever);
+                        app.tx_progress = tx.progress;
+                        furi_mutex_release(app.mutex);
+                        view_port_update(vp);
+                        InputEvent pev;
+                        while(furi_message_queue_get(app.queue, &pev, 0) == FuriStatusOk) {
+                            if(pev.type == InputTypeShort && pev.key == InputKeyBack) {
+                                aborted = true;
+                                tx.stop = true;
+                            }
                         }
+                        if(aborted) break;
                     }
-                    if(aborted) break;
+
+                    furi_hal_subghz_stop_async_tx();
+                    notification_message(notif, &sequence_blink_stop);
                 }
 
-                furi_hal_subghz_stop_async_tx();
                 furi_hal_subghz_sleep();
-                notification_message(notif, &sequence_blink_stop);
                 furi_semaphore_free(tx.done);
 
                 furi_mutex_acquire(app.mutex, FuriWaitForever);
-                app.state = aborted ? STATE_MENU : STATE_DONE;
+                app.tx_error = !tx_started;
+                app.state    = aborted ? STATE_MENU : STATE_DONE;
                 furi_mutex_release(app.mutex);
                 view_port_update(vp);
 
