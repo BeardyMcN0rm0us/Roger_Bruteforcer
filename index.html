@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Beardy's Battle Chess</title>
+<meta name="description" content="Chess where the pieces fight for their squares. Lessons, puzzles, and a ladder of AI opponents from rookie to grandmaster.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='80' font-size='80'%3E%E2%9A%94%EF%B8%8F%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="global-bar">
+  <button id="btn-sound" class="icon-btn" title="Sound on/off">🔊</button>
+  <button id="btn-gore" class="icon-btn" title="Battle style">🩸</button>
+</div>
+
+<!-- ============ MENU ============ -->
+<section id="screen-menu" class="screen active">
+  <div class="menu-inner">
+    <h1 class="logo"><span>Beardy's</span>Battle Chess</h1>
+    <p class="tagline">Every square is worth fighting for.</p>
+    <div id="menu-heroes"></div>
+    <nav class="menu-nav">
+      <button class="menu-btn" data-show="screen-opponents">⚔️ <b>Play</b><small>Battle the AI ladder — rookie to grandmaster</small></button>
+      <button class="menu-btn" id="btn-2p">🤝 <b>Two Player</b><small>Face a friend on this device</small></button>
+      <button class="menu-btn" data-show="screen-academy">🎓 <b>Academy</b><small>Learn chess move by move</small></button>
+      <button class="menu-btn" data-show="screen-puzzles">🧩 <b>Puzzles</b><small>Mate-in-one challenges</small></button>
+    </nav>
+    <div id="menu-rating" class="rating-badge"></div>
+  </div>
+</section>
+
+<!-- ============ OPPONENTS ============ -->
+<section id="screen-opponents" class="screen">
+  <header class="screen-head">
+    <button class="btn btn-back" data-show="screen-menu">◂ Menu</button>
+    <h2>Choose your opponent</h2>
+  </header>
+  <div class="color-pick">
+    Play as:
+    <label><input type="radio" name="pcolor" value="w" checked> Blue (White)</label>
+    <label><input type="radio" name="pcolor" value="b"> Red (Black)</label>
+    <label><input type="radio" name="pcolor" value="random"> Random</label>
+  </div>
+  <div id="opponent-list"></div>
+</section>
+
+<!-- ============ GAME ============ -->
+<section id="screen-game" class="screen">
+  <header class="screen-head game-head">
+    <button id="btn-quit" class="btn btn-back">◂ Quit</button>
+    <div class="game-head-mid">
+      <h2 id="game-title"></h2>
+      <div id="game-status"></div>
+    </div>
+  </header>
+  <div id="lesson-tip"></div>
+  <div class="game-layout">
+    <div id="board-wrap">
+      <div id="board">
+        <div id="board-cells"></div>
+        <div id="board-pieces"></div>
+      </div>
+    </div>
+    <aside id="side-panel">
+      <div class="tray-label">Fallen Red</div>
+      <div id="captured-b" class="tray"></div>
+      <div class="tray-label">Fallen Blue</div>
+      <div id="captured-w" class="tray"></div>
+      <div class="panel-btns">
+        <button id="btn-hint" class="btn">💡 Hint</button>
+        <button id="btn-undo" class="btn">↩ Undo</button>
+        <button id="btn-restart" class="btn">🔄 Restart</button>
+      </div>
+    </aside>
+  </div>
+</section>
+
+<!-- ============ ACADEMY ============ -->
+<section id="screen-academy" class="screen">
+  <header class="screen-head">
+    <button class="btn btn-back" data-show="screen-menu">◂ Menu</button>
+    <h2>🎓 The Academy</h2>
+  </header>
+  <p class="screen-sub">Earn a star to unlock the next lesson. Three stars means you nailed the par!</p>
+  <div id="lesson-path"></div>
+</section>
+
+<!-- ============ PUZZLES ============ -->
+<section id="screen-puzzles" class="screen">
+  <header class="screen-head">
+    <button class="btn btn-back" data-show="screen-menu">◂ Menu</button>
+    <h2>🧩 Mate in One</h2>
+  </header>
+  <p class="screen-sub">One perfect move ends the battle. Find it.</p>
+  <div id="puzzle-grid"></div>
+</section>
+
+<div id="battle-layer"></div>
+<div id="modal-layer"></div>
+
+<script src="js/engine.js"></script>
+<script src="js/ai.js"></script>
+<script src="js/characters.js"></script>
+<script src="js/sound.js"></script>
+<script src="js/battle.js"></script>
+<script src="js/opponents.js"></script>
+<script src="js/lessons.js"></script>
+<script src="js/main.js"></script>
+</body>
+</html>
